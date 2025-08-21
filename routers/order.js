@@ -1,11 +1,14 @@
-import express from 'express';
+import express from "express";
 import {
-  createOrder,
-  getOrdersByUser,
-  getOrderById,
-} from '../controller/order.js';
-import { authMiddleware } from '../middleware/middleware.js';
-
+    createOrder,
+    getOrdersByUser,
+    getOrderById,
+    getAllOrders,
+    deleteOrder,
+    updateOrderStatus,
+} from "../controller/order.js";
+import { authMiddleware } from "../middleware/middleware.js";
+import { adminMiddleware } from "../middleware/adminMiddleware.js";
 const router = express.Router();
 
 /**
@@ -76,7 +79,7 @@ const router = express.Router();
  *       500:
  *         description: Lỗi server
  */
-router.post('/orders', authMiddleware, createOrder);
+router.post("/orders", authMiddleware, createOrder);
 
 /**
  * @swagger
@@ -94,7 +97,7 @@ router.post('/orders', authMiddleware, createOrder);
  *       500:
  *         description: Lỗi server
  */
-router.get('/orders', authMiddleware, getOrdersByUser);
+router.get("/orders", authMiddleware, getOrdersByUser);
 
 /**
  * @swagger
@@ -121,6 +124,18 @@ router.get('/orders', authMiddleware, getOrdersByUser);
  *       500:
  *         description: Lỗi server
  */
-router.get('/orders/:orderId', authMiddleware, getOrderById);
+router.get("/orders/:orderId", authMiddleware, getOrderById);
+
+router.delete("/order/:id", authMiddleware, deleteOrder);
+
+//admin
+router.get("/ordersAll", authMiddleware, adminMiddleware, getAllOrders);
+router.post(
+    "/orders/:id/status",
+    authMiddleware,
+    adminMiddleware,
+    updateOrderStatus
+);
+
 
 export default router;

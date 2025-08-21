@@ -31,14 +31,45 @@ router.post("/register", async (req, res) => {
     res.status(201).json({ message: "User created successfully" });
 });
 
+// router.post("/login", async (req, res) => {
+//     try {
+//         const { username, password } = req.body;
+//         const isValid = handleValidateReq({ username, password }, res);
+
+//         if (isValid) {
+//             return;
+//         }
+
+//         const user = await User.findOne({ username });
+
+//         if (!user) {
+//             return res.status(400).json({ message: "User does not exist" });
+//         }
+
+//         const isMatch = await user.comparePassword(password);
+
+//         if (!isMatch) {
+//             return res.status(400).json({ message: "Invalid credentials" });
+//         }
+
+//         const token = jwt.sign({ id: user._id, username }, "dunglv", {
+//             expiresIn: "5m",
+//         });
+//         const refreshToken = jwt.sign({ id: user._id, username }, "dunglv", {
+//             expiresIn: "7d",
+//         });
+//         res.json({ token, refreshToken, id: user._id, role: user.role });
+//         console.log("da dang nhap");
+//     } catch (error) {
+//         res.status(500).json({ message: error.message });
+//     }
+// });
+
 router.post("/login", async (req, res) => {
     try {
         const { username, password } = req.body;
         const isValid = handleValidateReq({ username, password }, res);
-
-        if (isValid) {
-            return;
-        }
+        if (isValid) return;
 
         const user = await User.findOne({ username });
 
@@ -46,8 +77,12 @@ router.post("/login", async (req, res) => {
             return res.status(400).json({ message: "User does not exist" });
         }
 
-        const isMatch = await user.comparePassword(password);
+        // 🔒 Chặn user bị khóa
+        if (user.isLocked) {
+            return res.status(403).json({ message: "Tài khoản đã bị khóa" });
+        }
 
+        const isMatch = await user.comparePassword(password);
         if (!isMatch) {
             return res.status(400).json({ message: "Invalid credentials" });
         }
@@ -58,13 +93,11 @@ router.post("/login", async (req, res) => {
         const refreshToken = jwt.sign({ id: user._id, username }, "dunglv", {
             expiresIn: "7d",
         });
-        res.json({ token, refreshToken, id: user._id });
-        console.log('da dang nhap')
+        res.json({ token, refreshToken, id: user._id, role: user.role });
     } catch (error) {
         res.status(500).json({ message: error.message });
     }
 });
-
 const isValidRefreshToken = (refreshToken) => {
     try {
         const decoded = jwt.verify(refreshToken, "dunglv");

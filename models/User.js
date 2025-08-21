@@ -17,6 +17,10 @@ const UserSchema = new mongoose.Schema({
         enum: ["user", "admin"],
         default: "user",
     },
+    isLocked: {
+        type: Boolean,
+        default: false,
+    },
 });
 
 UserSchema.pre("save", async function (next) {

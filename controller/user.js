@@ -97,4 +97,110 @@ const getAllUser = async (req, res) => {
         });
     }
 };
-export { getInfoUser, deleteUser, getAllUser };
+const updateUser = async (req, res) => {
+    try {
+        const { userId } = req.params;
+        const { username, password, role } = req.body;
+
+        const user = await User.findById(userId);
+        if (!user) return res.status(404).json({ message: "User not found" });
+
+        // Không cho tự hạ quyền chính mình (tuỳ chọn, an toàn hơn)
+        if (
+            String(req.user._id) === String(userId) &&
+            role &&
+            role !== user.role
+        ) {
+            return res
+                .status(400)
+                .json({ message: "Không thể đổi vai trò của chính mình" });
+        }
+
+        if (typeof username === "string" && username.trim())
+            user.username = username.trim();
+        if (typeof role === "string")
+            user.role = role === "admin" ? "admin" : "user";
+        if (typeof password === "string" && password.trim())
+            user.password = password.trim(); // sẽ được hash ở pre('save')
+
+        await user.save();
+        res.json({ message: "Updated successfully" });
+    } catch (e) {
+        res.status(500).json({ message: e.message });
+    }
+};
+
+const lockUser = async (req, res) => {
+    try {
+        const { userId } = req.params;
+        const { isLocked } = req.body; // true = khóa, false = mở khóa
+
+        const user = await User.findById(userId);
+        if (!user) {
+            return res.status(404).json({
+                success: false,
+                message: "User not found",
+            });
+        }
+
+        user.isLocked = isLocked;
+        await user.save();
+
+        return res.status(200).json({
+            success: true,
+            message: `User ${isLocked ? "locked" : "unlocked"} successfully`,
+            data: user,
+        });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({
+            success: false,
+            message: "Error in Lock User API",
+            error: error.message,
+        });
+    }
+};
+const createUserByAdmin = async (req, res) => {
+    try {
+        const { username, password, role = "user" } = req.body;
+
+        if (!username || !password) {
+            return res
+                .status(400)
+                .json({ message: "username và password là bắt buộc" });
+        }
+
+        const existed = await User.findOne({ username });
+        if (existed) {
+            return res.status(409).json({ message: "Username đã tồn tại" });
+        }
+
+        const user = new User({
+            username: username.trim(),
+            password: password.trim(),
+            role: role === "admin" ? "admin" : "user",
+        });
+        await user.save();
+
+        return res.status(201).json({
+            success: true,
+            message: "Tạo user thành công",
+            data: {
+                _id: user._id,
+                username: user.username,
+                role: user.role,
+                isLocked: user.isLocked,
+            },
+        });
+    } catch (e) {
+        return res.status(500).json({ message: e.message });
+    }
+};
+export {
+    getInfoUser,
+    deleteUser,
+    getAllUser,
+    updateUser,
+    lockUser,
+    createUserByAdmin,
+};
