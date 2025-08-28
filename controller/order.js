@@ -269,7 +269,7 @@ export const updateOrderStatus = async (req, res) => {
     }
 
     // chỉ cho phép tiến lên hoặc vào trạng thái kết thúc
-    const flow = ["pending", "processing", "shipped", "delivered"];
+    const flow = ["pending", "completed", "processing", "shipped", "delivered"];
     const terminals = ["cancelled"];
 
     const session = await mongoose.startSession();
