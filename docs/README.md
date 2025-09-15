@@ -68,25 +68,4 @@ Tài liệu này bao gồm các phần sau:
 └─────────────┘     └─────────────┘     └─────────────┘     └─────────────┘
 ```
 
-## Hỗ trợ
 
-Nếu bạn có bất kỳ câu hỏi hoặc gặp vấn đề, vui lòng liên hệ:
-
-- Email: dunglvdeveloper@gmail.com
-- Facebook: [Fanpage](https://www.facebook.com/profile.php?id=61572799598951)
-- Facebook Group: [Group](https://www.facebook.com/groups/1175899190126042)
-- Youtube: [Youtube](https://www.youtube.com/@hoclaptrinhcungdung)
-
-## Đóng góp
-
-Chúng tôi rất hoan nghênh mọi đóng góp để cải thiện dự án. Nếu bạn muốn đóng góp, vui lòng:
-
-1. Fork dự án
-2. Tạo branch mới (`git checkout -b feature/amazing-feature`)
-3. Commit thay đổi của bạn (`git commit -m 'Add some amazing feature'`)
-4. Push lên branch (`git push origin feature/amazing-feature`)
-5. Mở Pull Request
-
-## Giấy phép
-
-Dự án này được phân phối dưới giấy phép ISC. Xem file `LICENSE` để biết thêm thông tin.
