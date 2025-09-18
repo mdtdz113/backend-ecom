@@ -5,6 +5,7 @@ import {
     getAllUser,
     getInfoUser,
     lockUser,
+    loginGoogle,
     updateUser,
 } from "../controller/user.js";
 import { authMiddleware } from "../middleware/middleware.js";
@@ -18,4 +19,5 @@ router.get("/user/All", authMiddleware, adminMiddleware, getAllUser);
 router.put("/user/:userId", authMiddleware, adminMiddleware, updateUser);
 router.put("/user/:userId/lock", authMiddleware, adminMiddleware, lockUser);
 router.post("/user/admin", authMiddleware, adminMiddleware, createUserByAdmin);
+router.post("/user/google", loginGoogle);
 export default router;

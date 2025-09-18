@@ -1,5 +1,8 @@
 import User from "../models/User.js";
+import jwt from "jsonwebtoken";
+import { OAuth2Client } from "google-auth-library";
 
+const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 const getInfoUser = async (req, res) => {
     const user = await User.findById(req.params.userId);
 
@@ -196,6 +199,84 @@ const createUserByAdmin = async (req, res) => {
         return res.status(500).json({ message: e.message });
     }
 };
+
+const loginGoogle = async (req, res) => {
+    try {
+        const { tokenGoogle } = req.body;
+        if (!tokenGoogle) {
+            return res.status(400).json({ message: "Thiếu tokenGoogle" });
+        }
+
+        // 1) Verify ID token với Google (an toàn hơn jwt-decode)
+        const ticket = await googleClient.verifyIdToken({
+            idToken: tokenGoogle,
+            audience: process.env.GOOGLE_CLIENT_ID,
+        });
+        const payload = ticket.getPayload(); // email, name, picture, sub...
+        const { email, name, picture, sub } = payload || {};
+
+        if (!email) {
+            return res
+                .status(400)
+                .json({ message: "Token Google không có email" });
+        }
+
+        // 2) Tìm hoặc tạo user tương ứng (dùng email làm username)
+        let user = await User.findOne({ username: email });
+        if (!user) {
+            user = new User({
+                username: email,
+                // không dùng password local cho Google, có thể lưu tạm sub/random
+                password: sub || Math.random().toString(36).slice(2),
+                role: "user",
+                avatar: picture || null,
+                displayName: name || email,
+            });
+            await user.save();
+        }
+
+        // 3) Chặn user bị khóa (giống flow login tay)
+        if (user.isLocked) {
+            return res.status(403).json({ message: "Tài khoản đã bị khóa" });
+        }
+
+        // 4) Ký JWT giống hệt login tay (để FE dùng chung)
+        const token = jwt.sign(
+            { id: user._id, username: user.username },
+            "dunglv", // giữ nguyên như /login thủ công :contentReference[oaicite:3]{index=3}
+            { expiresIn: "5m" }
+        );
+        const refreshToken = jwt.sign(
+            { id: user._id, username: user.username },
+            "dunglv",
+            { expiresIn: "7d" }
+        );
+
+        // 5) (tuỳ chọn) Nếu bạn vẫn muốn set cookie như ảnh, mở comment dưới:
+        // const isProd = process.env.NODE_ENV === "production";
+        // const secureFlag = isProd ? " Secure;" : "";
+        // res.setHeader("Set-Cookie", [
+        //   `accessToken=${token}; HttpOnly;${secureFlag} Max-Age=86400; Path=/; SameSite=Strict`,
+        //   `refreshToken=${refreshToken}; HttpOnly;${secureFlag} Max-Age=604800; Path=/; SameSite=Strict`,
+        //   `logged=true; Max-Age=86400; Path=/; SameSite=Lax`,
+        // ]);
+
+        // 6) QUAN TRỌNG: trả về JSON y hệt login tay
+        return res.json({
+            token,
+            refreshToken,
+            id: user._id,
+            role: user.role,
+            username: user.username, // thêm để FE đọc trực tiếp nếu cần
+        });
+    } catch (err) {
+        console.error(err);
+        return res
+            .status(500)
+            .json({ message: "Lỗi đăng nhập Google", error: err.message });
+    }
+};
+
 export {
     getInfoUser,
     deleteUser,
@@ -203,4 +284,5 @@ export {
     updateUser,
     lockUser,
     createUserByAdmin,
+    loginGoogle,
 };

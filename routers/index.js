@@ -4,7 +4,7 @@ import CartRouter from './cart.js';
 import UserRouter from './user.js';
 import OrderRouter from './order.js';
 import PaymentRouter from './payment.js';
-
+import PromotionCampaign from './promotionCampaign.js';
 export {
   AuthRouter,
   ProductRouter,
@@ -12,4 +12,5 @@ export {
   UserRouter,
   OrderRouter,
   PaymentRouter,
+  PromotionCampaign,
 };

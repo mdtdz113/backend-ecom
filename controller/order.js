@@ -1,10 +1,145 @@
+// controller/order.js — clean rewrite (flash-sale aware)
+import mongoose from "mongoose";
 import Order from "../models/Order.js";
 import Cart from "../models/Cart.js";
 import Product from "../models/Product.js";
-import mongoose from "mongoose";
+import PromotionCampaign from "../models/PromotionCampaign.js";
+
+/* ----------------------------- Helpers (campaign) ----------------------------- */
+const now = () => new Date();
+
+/**
+ * Tìm 1 campaign đang active, match productId (+size nếu có).
+ * (Cơ bản: lấy 1 cái phù hợp. Nâng cao có thể chọn theo priority/% cao nhất.)
+ */
+async function findActiveCampaign(
+    productId,
+    size,
+    channels = ["web"],
+    session = null
+) {
+    const filter = {
+        status: "active",
+        channels: { $in: channels },
+        startAt: { $lte: now() },
+        endAt: { $gte: now() },
+        "items.productId": String(productId),
+    };
+    if (size) filter["items.size"] = String(size);
+    return PromotionCampaign.findOne(filter).session(session);
+}
+
+/**
+ * Giữ quota remainingQty atomically bằng $inc + arrayFilters.
+ * Trả về { usedQty, campaign } trong transaction session hiện tại.
+ */
+async function reserveCampaignQty({ productId, size, requestedQty, session }) {
+    const campaign = await findActiveCampaign(
+        productId,
+        size,
+        ["web"],
+        session
+    );
+    if (!campaign) return { usedQty: 0, campaign: null };
+
+    const ci = campaign.items.find(
+        (x) =>
+            String(x.productId) === String(productId) &&
+            String(x.size ?? "") === String(size ?? "")
+    );
+    if (!ci || ci.remainingQty <= 0) return { usedQty: 0, campaign: null };
+
+    const toUse = Math.min(Number(requestedQty), Number(ci.remainingQty));
+
+    // Thử trừ đúng "toUse"
+    const updated = await PromotionCampaign.findOneAndUpdate(
+        {
+            _id: campaign._id,
+            status: "active",
+            startAt: { $lte: now() },
+            endAt: { $gte: now() },
+            "items.productId": String(productId),
+            ...(size ? { "items.size": String(size) } : {}),
+            "items.remainingQty": { $gte: toUse },
+        },
+        { $inc: { "items.$[it].remainingQty": -toUse } },
+        {
+            new: true,
+            session,
+            arrayFilters: [
+                {
+                    "it.productId": String(productId),
+                    ...(size ? { "it.size": String(size) } : {}),
+                },
+            ],
+        }
+    );
+
+    if (!updated) {
+        // Race: giữ phần còn lại nếu có
+        const latest = await findActiveCampaign(
+            productId,
+            size,
+            ["web"],
+            session
+        );
+        if (!latest) return { usedQty: 0, campaign: null };
+        const li = latest.items.find(
+            (x) =>
+                String(x.productId) === String(productId) &&
+                String(x.size ?? "") === String(size ?? "")
+        );
+        const rest = Math.max(0, Number(li?.remainingQty || 0));
+        if (rest === 0) return { usedQty: 0, campaign: null };
+
+        const updated2 = await PromotionCampaign.findOneAndUpdate(
+            {
+                _id: latest._id,
+                status: "active",
+                startAt: { $lte: now() },
+                endAt: { $gte: now() },
+                "items.productId": String(productId),
+                ...(size ? { "items.size": String(size) } : {}),
+                "items.remainingQty": { $gte: rest },
+            },
+            { $inc: { "items.$[it].remainingQty": -rest } },
+            {
+                new: true,
+                session,
+                arrayFilters: [
+                    {
+                        "it.productId": String(productId),
+                        ...(size ? { "it.size": String(size) } : {}),
+                    },
+                ],
+            }
+        );
+
+        if (!updated2) return { usedQty: 0, campaign: null };
+        return { usedQty: rest, campaign: updated2 };
+    }
+
+    return { usedQty: toUse, campaign: updated };
+}
+
+/* --------------------------------- Controllers --------------------------------- */
+
+/**
+ * POST /orders
+ * - Tạo đơn trong transaction
+ * - Áp dụng flash-sale (PromotionCampaign) nếu còn quota
+ * - Tách dòng nếu 1 phần vượt quota
+ * - Xoá cart sau khi tạo đơn thành công
+ */
 export const createOrder = async (req, res) => {
+    const session = await mongoose.startSession();
     try {
-        const userId = req.user._id; // Lấy từ middleware authentication
+        const userId = req.user?._id;
+        if (!userId)
+            return res
+                .status(401)
+                .json({ success: false, message: "Unauthorized" });
+
         const {
             firstName,
             lastName,
@@ -17,119 +152,205 @@ export const createOrder = async (req, res) => {
             phone,
             zipCode,
             email,
+            note,
+            shippingFee = 0,
+            paymentMethod = "cod",
         } = req.body;
 
-        // Validate required fields
-        if (
-            !firstName ||
-            !lastName ||
-            !country ||
-            !street ||
-            !cities ||
-            !state ||
-            !phone ||
-            !zipCode ||
-            !email
-        ) {
-            return res.status(400).json({
-                success: false,
-                message: "Vui lòng điền đầy đủ thông tin bắt buộc",
-            });
-        }
-
-        // Lấy tất cả items trong cart của user
-        const cartItems = await Cart.find({ userId, deletedAt: null });
-
-        if (!cartItems || cartItems.length === 0) {
-            return res.status(400).json({
-                success: false,
-                message: "Giỏ hàng trống",
-            });
-        }
-
-        // Tính tổng tiền và chuẩn bị items cho order
-        let totalAmount = 0;
-        const orderItems = [];
-
-        for (const cartItem of cartItems) {
-            // Lấy thông tin sản phẩm để tính giá
-            const product = await Product.findOne({
-                _id: cartItem.productId,
-                deletedAt: null,
-            });
-
-            if (!product) {
-                return res.status(400).json({
-                    success: false,
-                    message: `Sản phẩm với ID ${cartItem.productId} không tồn tại`,
-                });
-            }
-
-            const itemTotal = product.price * cartItem.quantity;
-            totalAmount += itemTotal;
-
-            orderItems.push({
-                productId: cartItem.productId,
-                quantity: cartItem.quantity,
-                size: cartItem.size,
-                price: product.price,
-            });
-        }
-
-        // Tạo order mới
-        const newOrder = new Order({
-            userId,
+        // Validate field bắt buộc (giữ tương tự bản cũ)
+        const required = [
             firstName,
             lastName,
-            companyName: companyName || "",
             country,
             street,
-            apartment: apartment || "",
             cities,
             state,
             phone,
             zipCode,
             email,
-            status: "pending",
-            items: orderItems,
-            totalAmount,
+        ];
+        if (required.some((v) => !v)) {
+            return res
+                .status(400)
+                .json({
+                    success: false,
+                    message: "Vui lòng điền đầy đủ thông tin bắt buộc",
+                });
+        }
+
+        // Lấy cart
+        const cartItems = await Cart.find({ userId, deletedAt: null }).lean();
+        if (!cartItems?.length) {
+            return res
+                .status(400)
+                .json({ success: false, message: "Giỏ hàng trống" });
+        }
+
+        // Preload product map (giảm round-trips trong tx)
+        const productIds = cartItems.map((it) => it.productId);
+        const products = await Product.find({
+            _id: { $in: productIds },
+            deletedAt: null,
+        }).lean();
+        const pMap = new Map(products.map((p) => [String(p._id), p]));
+
+        let orderDocArray = null;
+
+        await session.withTransaction(async () => {
+            let subtotal = 0;
+            const orderItems = [];
+
+            for (const it of cartItems) {
+                const p = pMap.get(String(it.productId));
+                if (!p)
+                    throw new Error(
+                        `Sản phẩm với ID ${it.productId} không tồn tại`
+                    );
+
+                const basePrice = Number(p.price) || 0;
+                const qty = Number(it.quantity || 0);
+                const sizeLabel = it.size ?? null;
+
+                // Giữ quota campaign (atomic)
+                const { usedQty, campaign } = await reserveCampaignQty({
+                    productId: it.productId,
+                    size: sizeLabel,
+                    requestedQty: qty,
+                    session,
+                });
+
+                if (usedQty <= 0) {
+                    // Không có ưu đãi → giá thường
+                    subtotal += basePrice * qty;
+                    orderItems.push({
+                        productId: it.productId,
+                        quantity: qty,
+                        size: sizeLabel,
+                        price: basePrice,
+                        promotion: null,
+                    });
+                } else if (usedQty >= qty) {
+                    // Toàn bộ qty được giảm giá
+                    const promoUnit = Math.round(
+                        (basePrice * (100 - Number(campaign.percent))) / 100
+                    );
+                    subtotal += promoUnit * qty;
+                    orderItems.push({
+                        productId: it.productId,
+                        quantity: qty,
+                        size: sizeLabel,
+                        price: promoUnit,
+                        priceOriginal: basePrice,
+                        promotion: {
+                            campaignId: campaign._id,
+                            name: campaign.name,
+                            percent: campaign.percent,
+                            usedQty: qty,
+                        },
+                    });
+                } else {
+                    // Một phần có khuyến mãi, phần còn lại giá thường → tách 2 dòng
+                    const promoUnit = Math.round(
+                        (basePrice * (100 - Number(campaign.percent))) / 100
+                    );
+                    const normalQty = qty - usedQty;
+
+                    subtotal += promoUnit * usedQty + basePrice * normalQty;
+
+                    // Dòng A: phần giảm
+                    orderItems.push({
+                        productId: it.productId,
+                        quantity: usedQty,
+                        size: sizeLabel,
+                        price: promoUnit,
+                        priceOriginal: basePrice,
+                        promotion: {
+                            campaignId: campaign._id,
+                            name: campaign.name,
+                            percent: campaign.percent,
+                            usedQty,
+                        },
+                    });
+                    // Dòng B: phần thường
+                    orderItems.push({
+                        productId: it.productId,
+                        quantity: normalQty,
+                        size: sizeLabel,
+                        price: basePrice,
+                        promotion: null,
+                    });
+                }
+            }
+
+            const totalAmount = subtotal + Number(shippingFee || 0);
+
+            // Tạo Order (snapshot giá)
+            orderDocArray = await Order.create(
+                [
+                    {
+                        userId,
+                        firstName,
+                        lastName,
+                        companyName: companyName || "",
+                        country,
+                        street,
+                        apartment: apartment || "",
+                        cities,
+                        state,
+                        phone,
+                        zipCode,
+                        email,
+                        note: note || "",
+                        items: orderItems,
+                        subtotal,
+                        shippingFee: Number(shippingFee || 0),
+                        totalAmount,
+                        status: "pending",
+                        payment: {
+                            method: paymentMethod,
+                            status: "unpaid",
+                            content: null,
+                            paidAt: null,
+                        },
+                    },
+                ],
+                { session }
+            );
+
+            // Clear cart (soft)
+            await Cart.updateMany(
+                { userId, deletedAt: null },
+                { deletedAt: new Date() },
+                { session }
+            );
         });
 
-        const savedOrder = await newOrder.save();
-
-        // Xóa items khỏi cart sau khi tạo order thành công
-        await Cart.updateMany(
-            { userId, deletedAt: null },
-            { deletedAt: new Date() }
-        );
-
-        res.status(201).json({
+        return res.status(201).json({
             success: true,
             message: "Đơn hàng đã được tạo thành công",
-            data: savedOrder,
+            data: orderDocArray?.[0] || null,
         });
     } catch (error) {
-        console.error("Error creating order:", error);
-        res.status(500).json({
-            success: false,
-            message: "Lỗi server khi tạo đơn hàng",
-            error: error.message,
-        });
+        console.error("createOrder tx error:", error);
+        return res
+            .status(500)
+            .json({
+                success: false,
+                message: error.message || "Lỗi server khi tạo đơn hàng",
+            });
+    } finally {
+        session.endSession();
     }
 };
 
+/* ------------------------------ Query (không đổi) ------------------------------ */
 export const getOrdersByUser = async (req, res) => {
     try {
         const userId = req.user._id;
-
         const orders = await Order.find({ userId, deletedAt: null }).sort({
             createdAt: -1,
         });
-
-        res.status(200).json({
-            success: true,
-            data: orders,
-        });
+        res.status(200).json({ success: true, data: orders });
     } catch (error) {
         console.error("Error getting orders:", error);
         res.status(500).json({
@@ -144,24 +365,16 @@ export const getOrderById = async (req, res) => {
     try {
         const userId = req.user._id;
         const { orderId } = req.params;
-
         const order = await Order.findOne({
             _id: orderId,
             userId,
             deletedAt: null,
         });
-
-        if (!order) {
-            return res.status(404).json({
-                success: false,
-                message: "Không tìm thấy đơn hàng",
-            });
-        }
-
-        res.status(200).json({
-            success: true,
-            data: order,
-        });
+        if (!order)
+            return res
+                .status(404)
+                .json({ success: false, message: "Không tìm thấy đơn hàng" });
+        res.status(200).json({ success: true, data: order });
     } catch (error) {
         console.error("Error getting order:", error);
         res.status(500).json({
@@ -171,28 +384,21 @@ export const getOrderById = async (req, res) => {
         });
     }
 };
-// GET /orders/all?page=1&pageSize=20&status=processing&q=abc&from=2025-08-01&to=2025-08-18
+
+/**
+ * GET /orders/all?page=1&limit=20&status=processing&q=abc&from=2025-08-01&to=2025-08-18
+ */
 export const getAllOrders = async (req, res) => {
     try {
-        const {
-            page = 1,
-            limit = 20,
-            status, // pending | processing | shipped | delivered | cancelled
-            from, // yyyy-mm-dd
-            to, // yyyy-mm-dd
-            q, // search theo tên/email/phone
-        } = req.query;
-
+        const { page = 1, limit = 20, status, from, to, q } = req.query;
         const filter = { deletedAt: null };
 
         if (status) filter.status = status;
-
         if (from || to) {
             filter.createdAt = {};
-            if (from) filter.createdAt.$gte = new Date(from);
-            if (to) filter.createdAt.$lte = new Date(to);
+            if (from) filter.createdAt.$gte = new Date(from + "T00:00:00.000Z");
+            if (to) filter.createdAt.$lte = new Date(to + "T23:59:59.999Z");
         }
-
         if (q) {
             filter.$or = [
                 { email: { $regex: q, $options: "i" } },
@@ -203,14 +409,12 @@ export const getAllOrders = async (req, res) => {
         }
 
         const skip = (Number(page) - 1) * Number(limit);
-
         const [orders, total] = await Promise.all([
             Order.find(filter)
                 .sort({ createdAt: -1 })
                 .skip(skip)
                 .limit(Number(limit))
                 .select("-__v")
-                .populate("userId", "firstName lastName email") // lấy thêm info user
                 .lean(),
             Order.countDocuments(filter),
         ]);
@@ -227,23 +431,21 @@ export const getAllOrders = async (req, res) => {
         });
     } catch (error) {
         console.error("adminGetAllOrders error:", error);
-        return res.status(500).json({
-            success: false,
-            message: "Lỗi khi lấy danh sách đơn hàng",
-        });
+        return res
+            .status(500)
+            .json({
+                success: false,
+                message: "Lỗi khi lấy danh sách đơn hàng",
+            });
     }
 };
 
 export const deleteOrder = async (req, res) => {
     try {
         const { id } = req.params;
-
         const deletedOrder = await Order.findByIdAndDelete(id);
-
-        if (!deletedOrder) {
+        if (!deletedOrder)
             return res.status(404).json({ message: "Order not found" });
-        }
-
         res.status(200).json({
             message: "Order deleted successfully",
             order: deletedOrder,
@@ -256,19 +458,15 @@ export const deleteOrder = async (req, res) => {
     }
 };
 
-//admin
-
+/* --------------------------- Update status + stock --------------------------- */
 export const updateOrderStatus = async (req, res) => {
     const { id } = req.params;
     const { status: nextStatus } = req.body;
-
-    if (!nextStatus) {
+    if (!nextStatus)
         return res
             .status(400)
             .json({ success: false, message: "Thiếu status mới" });
-    }
 
-    // chỉ cho phép tiến lên hoặc vào trạng thái kết thúc
     const flow = ["pending", "completed", "processing", "shipped", "delivered"];
     const terminals = ["cancelled"];
 
@@ -284,14 +482,13 @@ export const updateOrderStatus = async (req, res) => {
                 flow.includes(current) &&
                 flow.indexOf(nextStatus) >= flow.indexOf(current);
             const terminalOK = terminals.includes(nextStatus);
-
             if (!forwardOK && !terminalOK) {
                 throw new Error(
                     `Chuyển trạng thái không hợp lệ từ "${current}" sang "${nextStatus}"`
                 );
             }
 
-            // Helpers: nhận diện tên size & field tồn kho
+            // Helpers: nhận diện size & trường số lượng trong biến thể
             const getSizeName = (obj) =>
                 obj?.size ??
                 obj?.name ??
@@ -311,33 +508,24 @@ export const updateOrderStatus = async (req, res) => {
                 return null;
             };
 
-            // ===== Trừ kho khi pending -> processing =====
+            // Trừ kho khi từ pending -> processing (lần đầu)
             if (current === "pending" && nextStatus === "processing") {
                 for (const it of order.items) {
-                    const productId = it.productId;
-                    const qtyNeeded = Number(it.quantity ?? it.qty);
-                    const sizeNeeded = (it.size ?? it?.variant?.size ?? "")
-                        .toString()
-                        .trim();
-
-                    if (!productId || !sizeNeeded || !qtyNeeded) {
-                        throw new Error(
-                            "Thiếu productId/size/quantity trong order.items"
-                        );
-                    }
-
-                    const product =
-                        await Product.findById(productId).session(session);
+                    const product = await Product.findById(
+                        it.productId
+                    ).session(session);
                     if (!product)
-                        throw new Error(`Không tìm thấy sản phẩm ${productId}`);
-
-                    if (!Array.isArray(product.size)) {
+                        throw new Error(
+                            `Không tìm thấy sản phẩm ${it.productId}`
+                        );
+                    if (!Array.isArray(product.size))
                         throw new Error(
                             "Cấu trúc Product.size không phải mảng"
                         );
-                    }
 
-                    // tìm biến thể size (so sánh không phân biệt hoa thường)
+                    const sizeNeeded = (it.size ?? it?.variant?.size ?? "")
+                        .toString()
+                        .trim();
                     const idx = product.size.findIndex((sv) => {
                         const name = getSizeName(sv);
                         return (
@@ -346,40 +534,37 @@ export const updateOrderStatus = async (req, res) => {
                                 sizeNeeded.toLowerCase()
                         );
                     });
-
                     if (idx === -1) {
                         const available = product.size
                             .map((sv) => getSizeName(sv))
                             .filter(Boolean)
                             .join(", ");
                         throw new Error(
-                            `Không tìm thấy biến thể size "${sizeNeeded}". Size có sẵn: ${available || "không có"}`
+                            `Không tìm thấy size "${sizeNeeded}". Size có sẵn: ${available || "không có"}`
                         );
                     }
 
                     const slot = product.size[idx];
                     const qtyField = getQtyField(slot);
-                    if (!qtyField) {
+                    if (!qtyField)
                         throw new Error(
-                            "Không tìm thấy trường số lượng trong biến thể size (cần quantity/qty/stock/amount/value)"
+                            "Không thấy trường số lượng (quantity/qty/stock/amount/value) trong biến thể size"
                         );
-                    }
 
                     const currentQty = Number(slot[qtyField] ?? 0);
-                    if (currentQty < qtyNeeded) {
+                    const qtyNeeded = Number(it.quantity ?? it.qty);
+                    if (currentQty < qtyNeeded)
                         throw new Error(
                             `Hết hàng size ${sizeNeeded}: cần ${qtyNeeded}, còn ${currentQty}`
                         );
-                    }
 
-                    // trừ tồn và lưu
                     product.size[idx][qtyField] = currentQty - qtyNeeded;
                     product.markModified("size");
                     await product.save({ session });
                 }
             }
 
-            // ===== (Tuỳ chọn) Hoàn kho nếu hủy sau khi đã trừ =====
+            // Hoàn kho nếu huỷ sau khi đã trừ (processing/shipped -> cancelled)
             if (
                 nextStatus === "cancelled" &&
                 ["processing", "shipped"].includes(current)
@@ -414,7 +599,6 @@ export const updateOrderStatus = async (req, res) => {
                 }
             }
 
-            // Lưu trạng thái mới
             order.status = nextStatus;
             await order.save({ session });
         });
@@ -432,6 +616,7 @@ export const updateOrderStatus = async (req, res) => {
         session.endSession();
     }
 };
+
 export const softDeleteOrder = async (req, res) => {
     try {
         const { id } = req.params;
