@@ -3,13 +3,10 @@ import Product from '../models/Product.js';
 
 const getCart = async (req, res) => {
     try {
-        // Truy vấn giỏ hàng của người dùng để lấy danh sách các mục giỏ hàng
+        
         const cart = await Cart.find({ userId: req.params.userId });
 
-        // Tạo một danh sách productId từ các mục giỏ hàng
         const productIds = cart.map((item) => item.productId);
-
-        // Truy vấn để lấy thông tin chi tiết của các sản phẩm
         const products = await Product.find({ _id: { $in: productIds } });
 
         const cartWithProductDetails = cart.map((item) => {
